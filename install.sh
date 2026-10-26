@@ -690,6 +690,12 @@ write_config() {
     local port="$1" uuid="$2" decryption_config="$3" encryption_config="$4"
     local private_key="$5" public_key="$6" sni="$7" short_id="$8"
     local tmp_config
+    # Prevent legacy menu 1/7 from erasing additional standard inbounds.
+    if [ -f "$xray_config_path" ] &&
+       jq -e '(.inbounds | length) > 1 or any(.inbounds[]?; .settings.decryption == "none")' "$xray_config_path" >/dev/null 2>&1; then
+        error "当前包含普通/多个 VLESS 节点；旧菜单 1/7 会覆盖它们，已拒绝此操作。"
+        return 1
+    fi
 
     if ! prepare_xray_log_permissions; then return 1; fi
     # Xray's external config loader requires the filename to end in .json.
