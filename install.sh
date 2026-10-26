@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # VLESS Encryption / Standard VLESS + REALITY + Vision 管理脚本
-# 版本: V1.8.0 (新增 sing-box 兼容普通 VLESS 节点)
+# 版本: V1.8.1 (修复普通节点展示与运行校验)
 # 可选配置: VLESS Encryption (ML-KEM-768) 或 Standard VLESS + REALITY + Vision
 
 set -eo pipefail
 umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.8.1"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 
@@ -177,7 +177,8 @@ check_xray_status() {
     fi
 
     local xray_version
-    xray_version=$($xray_binary_path version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知")
+    xray_version=$("$xray_binary_path" version 2>/dev/null | sed -n '1{s/^[^ ]* \([^ ]*\).*/\1/p;q;}')
+    [ -n "$xray_version" ] || xray_version="未知"
 
     local service_status
     
@@ -986,6 +987,11 @@ run_add_standard() {
     chmod 600 "$HOME/.xray-standard-$port.info"
     success "普通 VLESS + REALITY + Vision 节点添加成功（端口 $port）"
     view_standard_subscription "$port" || true
+    if command -v ss >/dev/null 2>&1; then
+        ss -lnt | grep -E "[:.]$port[[:space:]]" || info "注意：端口 $port 暂未在 ss 中显示监听，请检查 OpenRC 日志。"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lnt | grep -E "[:.]$port[[:space:]]" || info "注意：端口 $port 暂未在 netstat 中显示监听，请检查 OpenRC 日志。"
+    fi
 }
 
 add_standard_interactive() {
@@ -1038,9 +1044,9 @@ view_all_subscriptions() {
     fi
     shopt -s nullglob
     for f in "$HOME"/.xray-standard-*.info; do
-        port="\${f##*/}"
-        port="\${port#.xray-standard-}"
-        port="\${port%.info}"
+        port="${f##*/}"
+        port="${port#.xray-standard-}"
+        port="${port%.info}"
         if [[ "$port" =~ ^[0-9]+$ ]] && jq -e --argjson port "$port" \
           'any(.inbounds[]?; .port == $port and .settings.decryption == "none")' "$xray_config_path" >/dev/null 2>&1; then
             view_standard_subscription "$port" || true
