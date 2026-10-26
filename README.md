@@ -56,6 +56,11 @@ bash /root/xray-menu.sh install --port 12345 --sni www.sega.com
 
 每次版本升级须同步修改 `SCRIPT_VERSION`、新增 `releases/vX.Y.Z.md` 更新说明，并推送同名 `vX.Y.Z` Git 标签。仓库内的 `.github/workflows/release.yml` 将自动执行测试，测试通过后发布 [GitHub Releases](https://github.com/yonghu996/vless-encryption-reality-alpine/releases)。不要仅修改 README 而不发布对应 Release。
 
+## v1.8.1 — 节点列表修复
+
+- 修复菜单 8 中 Bash 变量转义导致普通节点无法显示的问题；不改变已建节点。
+- 新增节点后尝试提示 TCP 端口监听情况。
+
 ## v1.8.0 — sing-box 兼容模式
 
 - 增加不带 VLESS Encryption 的普通 VLESS + REALITY + Vision 入站。
