@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # VLESS Encryption + REALITY 一键安装管理脚本
-# 版本: V1.7.1
+# 版本: V1.7.2 (Alpine/OpenRC 修复)
 # 固定配置: VLESS Encryption (native + 0-RTT + ML-KEM-768) + REALITY + xtls-rprx-vision
 
-set -e
+set -eo pipefail
+umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.7.2"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 
@@ -93,20 +94,23 @@ get_public_ip_v6() {
 }
 
 execute_official_script() {
-    info "正在执行官方安装脚本..."
-    # 使用 "$@" 以便将所有参数正确地传递给子脚本
-    curl -sL "https://github.com/XTLS/Xray-install/raw/main${url_extra_path}/install-release.sh" | bash -s -- "$@"
+    local url="https://github.com/XTLS/Xray-install/raw/main${url_extra_path}/install-release.sh"
+    info "执行 Xray 官方安装器: $*"
+    # pipefail ensures failed downloads do not become false successes.
+    if ! curl -fsSL --retry 2 --connect-timeout 10 "$url" | bash -s -- "$@"; then
+        error "官方安装器执行失败: $*"
+        return 1
+    fi
 }
 
+
 check_xray_version() {
-    if [ ! -f "$xray_binary_path" ]; then
-        return 1
-    fi
-    if ! $xray_binary_path help 2>/dev/null | grep -q "vlessenc" || ! $xray_binary_path help 2>/dev/null | grep -q "x25519"; then
-        return 1
-    fi
-    return 0
+    [ -x "$xray_binary_path" ] || return 1
+    local help_output
+    help_output=$("$xray_binary_path" help 2>/dev/null) || return 1
+    [[ "$help_output" == *vlessenc* && "$help_output" == *x25519* ]]
 }
+
 
 check_os_and_dependencies() {
     info "正在检查操作系统和依赖..."
@@ -154,21 +158,17 @@ pre_check() {
     check_os_and_dependencies
 }
 
-service_is_noactive() {
+service_is_active() {
     local svc="$1"
-
-    # OpenRC（Alpine linux）
     if command -v rc-service >/dev/null 2>&1; then
-        # rc-service 用 status 并过滤得到行数判断是否已启动
-        return $(rc-service $svc status 2>/dev/null | grep -c started)
-    # 如果系统有 systemctl，优先用 systemd 方式
-    elif systemctl is-active --quiet $svc 2>/dev/null; then
-       return 1
+        rc-service "$svc" status >/dev/null 2>&1
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet "$svc"
     else
-        echo "未知的服务管理方式!" >&2
-        return 0
+        return 1
     fi
 }
+
 
 check_xray_status() {
     if [ ! -f "$xray_binary_path" ]; then
@@ -181,7 +181,7 @@ check_xray_status() {
 
     local service_status
     
-    if ! service_is_noactive xray; then
+    if service_is_active xray; then
         service_status="$(cecho "$C_GREEN" "运行中")"
     else
         service_status="$(cecho "$C_RED" "未运行")"
@@ -203,6 +203,36 @@ is_valid_port() {
     else
         return 1
     fi
+}
+
+
+is_valid_uuid() {
+    [[ "$1" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]
+}
+
+is_valid_sni() {
+    local host="$1" label
+    [ "${#host}" -le 253 ] && [[ "$host" == *.* ]] || return 1
+    [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$host" != .* && "$host" != *. && "$host" != *..* ]] || return 1
+    local -a labels
+    IFS='.' read -r -a labels <<< "$host"
+    for label in "${labels[@]}"; do
+        [ "${#label}" -le 63 ] && [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+is_valid_short_id() {
+    [[ "$1" =~ ^[[:xdigit:]]*$ ]] && [ "${#1}" -le 16 ] && (( ${#1} % 2 == 0 ))
+}
+
+validate_node_inputs() {
+    local port="$1" uuid="$2" sni="$3" sid="$4"
+    if ! is_valid_port "$port"; then error "端口必须为 1-65535"; return 1; fi
+    if ! is_valid_uuid "$uuid"; then error "UUID 格式无效"; return 1; fi
+    if ! is_valid_sni "$sni"; then error "SNI 必须是合法域名，例如 www.sega.com（不要输入反斜杠）"; return 1; fi
+    if ! is_valid_short_id "$sid"; then error "Short ID 必须是偶数位十六进制字符，最多16位"; return 1; fi
+    return 0
 }
 
 generate_uuid() {
@@ -331,122 +361,139 @@ install_xray() {
     echo -n "请输入REALITY Short ID (默认: 20220701): "
     read -r short_id
     [ -z "$short_id" ] && short_id="20220701"
+    if ! validate_node_inputs "$port" "$uuid" "$sni" "$short_id"; then return 1; fi
 
     run_install "$port" "$uuid" "$sni" "$short_id"
 }
 
 update_xray() {
-    if [ ! -f "$xray_binary_path" ]; then
-        error "错误: Xray 未安装。"
-        return
+    if [ ! -x "$xray_binary_path" ]; then
+        error "Xray 未安装。"
+        return 1
     fi
 
-    info "正在检查最新版本..."
-    local current_version
-    current_version=$($xray_binary_path version | head -n 1 | awk '{print $2}' | sed 's/v//')
-    local latest_version
-    latest_version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' | sed 's/v//' 2>/dev/null || echo "")
+    info "正在检查 Xray 最新版本..."
+    local current_version latest_version
+    current_version=$("$xray_binary_path" version | head -n 1 | awk '{print $2}' | sed 's/^v//')
+    latest_version=$(curl -fsSL --max-time 15 \
+        https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name // empty' | sed 's/^v//' || true)
     if [ -z "$latest_version" ]; then
         error "获取最新版本号失败。"
-        return
+        return 1
     fi
-    info "当前版本: ${current_version}，最新版本: ${latest_version}"
-
+    info "当前: $current_version；最新: $latest_version"
     if [ "$current_version" = "$latest_version" ] && check_xray_version; then
-        success "您的 Xray 已是最新版本。"
-        return
+        success "Xray 已是最新版本。"
+        return 0
     fi
 
-    info "开始更新..."
     if ! execute_official_script install; then
         error "Xray 核心更新失败！"
-        return
+        return 1
     fi
-    info "正在更新 Geo 数据文件..."
-    execute_official_script install-geodata
-    if ! restart_xray; then
-        return
+    if ! execute_official_script update-geodata; then
+        info "Geo 扩展数据下载失败；Xray 自带基础 Geo 数据，不影响此节点。"
     fi
+    if ! check_xray_version || ! restart_xray; then return 1; fi
     success "Xray 更新成功！"
 }
 
-restart_xray() {
-    if [ ! -f "$xray_binary_path" ]; then
-        error "错误: Xray 未安装。"
-        return 1
-    fi
 
-    info "正在重启 Xray 服务..."
-    if command -v rc-service; then
-        if ! rc-service xray restart; then
-            error "错误: Xray 服务重启失败, 请检查日志。"
+restart_xray() {
+    if [ ! -x "$xray_binary_path" ]; then error "Xray 未安装。"; return 1; fi
+    info "正在启动或重启 Xray..."
+    if command -v rc-service >/dev/null 2>&1; then
+        if ! rc-update add xray default >/dev/null 2>&1; then
+            error "无法启用 Xray OpenRC 开机自启"
             return 1
         fi
-    elif ! systemctl restart xray; then
-        error "错误: Xray 服务重启失败, 请检查日志。"
+        if service_is_active xray; then
+            if ! rc-service xray restart; then error "OpenRC 重启失败"; return 1; fi
+        else
+            if ! rc-service xray start; then error "OpenRC 启动失败"; return 1; fi
+        fi
+    elif command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl enable xray >/dev/null 2>&1 || ! systemctl restart xray; then
+            error "systemd 启动失败"
+            return 1
+        fi
+    else
+        error "未找到 OpenRC 或 systemd 服务管理器"
         return 1
     fi
-
     sleep 1
-    if service_is_noactive xray; then
-        error "错误: Xray 服务启动失败, 请检查日志。"
+    if ! service_is_active xray; then
+        error "Xray 没有保持运行，请检查配置和日志"
         return 1
     fi
-
-    success "Xray 服务已成功重启！"
-    return 0
+    success "Xray 已运行，并已设置开机自启"
 }
+
 
 stop_xray() {
-    if [ ! -f "$xray_binary_path" ]; then
-        error "错误: Xray 未安装。"
+    if [ ! -x "$xray_binary_path" ]; then error "Xray 未安装。"; return 1; fi
+    if ! service_is_active xray; then success "Xray 已停止"; return 0; fi
+    if command -v rc-service >/dev/null 2>&1; then
+        if ! rc-service xray stop; then error "OpenRC 停止失败"; return 1; fi
+    elif command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl stop xray; then error "systemd 停止失败"; return 1; fi
+    else
+        error "没有可用的服务管理器"
         return 1
     fi
-
-    info "正在停止 Xray 服务..."
-    if ! rc-service xray stop; then
-        error "错误: Xray 服务停止失败, 请检查日志。"
-        return 1
-    elif ! systemctl stop xray; then
-        error "错误: Xray 服务停止失败, 请检查日志。"
-        return 1
-    fi
-
-    success "Xray 服务已成功停止！"
-    return 0
+    success "Xray 已停止"
 }
+
 
 uninstall_xray() {
-    if [ ! -f "$xray_binary_path" ]; then
-        error "错误: Xray 未安装。"
-        return
-    fi
-
-    echo -n "您确定要卸载 Xray 吗？[Y/n]: "
+    if [ ! -f "$xray_binary_path" ]; then error "Xray 未安装。"; return 1; fi
+    echo "警告：将删除 Xray 程序、配置、日志和本脚本生成的客户端信息。"
+    echo -n "确认卸载？请输入 yes: "
+    local confirm
     read -r confirm
-    if [ "$confirm" = "n" ] || [ "$confirm" = "N" ]; then
-        info "卸载操作已取消。"
-        return
-    fi
+    if [ "$confirm" != "yes" ]; then info "已取消卸载"; return 0; fi
 
-    info "正在卸载 Xray..."
-    if execute_official_script remove --purge; then
-        rm -f "$client_vless_link_file" "$client_encryption_info_file" "$client_reality_info_file"
-        success "Xray 已成功卸载。"
+    if command -v rc-service >/dev/null 2>&1; then
+        # The official Alpine installer has no 'remove' action.
+        if service_is_active xray && ! rc-service xray stop; then
+            error "服务仍在运行，已取消删除。"
+            return 1
+        fi
+        rc-update del xray default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/xray /etc/logrotate.d/xray "$xray_binary_path"
+        rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
     else
-        error "Xray 卸载失败！"
+        if ! execute_official_script remove --purge; then
+            error "官方卸载脚本失败"
+            return 1
+        fi
+    fi
+    rm -f "$client_vless_link_file" "$client_encryption_info_file" "$client_reality_info_file"
+    success "Xray 已卸载；系统依赖及专用系统用户保留"
+}
+
+
+view_xray_log() {
+    if [ ! -x "$xray_binary_path" ]; then error "Xray 未安装。"; return 1; fi
+    if command -v rc-service >/dev/null 2>&1; then
+        echo "Xray OpenRC 状态："
+        rc-service xray status || true
+        if [ -f /var/log/xray/error.log ]; then
+            info "显示最近100行错误日志；按 Ctrl+C 退出..."
+            tail -n 100 -f /var/log/xray/error.log
+        else
+            info "暂无 /var/log/xray/error.log；可运行 rc-service xray checkconfig 排查启动失败"
+            rc-service xray checkconfig || true
+        fi
+    elif command -v journalctl >/dev/null 2>&1; then
+        info "按 Ctrl+C 退出日志..."
+        journalctl -u xray -f --no-pager
+    else
+        error "没有可用的日志查看工具"
         return 1
     fi
 }
 
-view_xray_log() {
-    if [ ! -f "$xray_binary_path" ]; then
-        error "错误: Xray 未安装。"
-        return
-    fi
-    info "按 Ctrl+C 退出日志..."
-    journalctl -u xray -f --no-pager
-}
 
 modify_config() {
     if [ ! -f "$xray_config_path" ]; then
@@ -485,6 +532,7 @@ modify_config() {
     echo -n "Short ID (当前: ${current_short_id}): "
     read -r short_id
     [ -z "$short_id" ] && short_id=$current_short_id
+    if ! validate_node_inputs "$port" "$uuid" "$sni" "$short_id"; then return 1; fi
 
     local encryption_info
     encryption_info=$(generate_vless_encryption_config)
@@ -503,14 +551,14 @@ modify_config() {
     local public_key
     public_key=$(echo "$reality_keys" | cut -d'|' -f2)
 
-    write_config "$port" "$uuid" "$decryption_config" "$encryption_config" "$private_key" "$public_key" "$sni" "$short_id"
-    
+    if ! write_config "$port" "$uuid" "$decryption_config" "$encryption_config" "$private_key" "$public_key" "$sni" "$short_id"; then return 1; fi
+
     if ! restart_xray; then
         return
     fi
     
     success "配置修改成功！"
-    view_subscription_info
+    view_subscription_info || true
 }
 
 view_subscription_info() {
@@ -573,6 +621,7 @@ view_subscription_info() {
         echo "${yaml_url}"
     else
         echo "${vless_url}" > "$client_vless_link_file"
+        chmod 600 "$client_vless_link_file"
         echo "----------------------------------------------------------------"
         cecho "$C_CYAN" " --- Xray VLESS-Encryption + REALITY + Vision 订阅信息 --- "
         echo " 节点名称: $(cecho "$C_PURPLE" "$link_name_raw")"
@@ -604,11 +653,14 @@ view_subscription_info() {
 write_config() {
     local port="$1" uuid="$2" decryption_config="$3" encryption_config="$4"
     local private_key="$5" public_key="$6" sni="$7" short_id="$8"
+    local tmp_config
 
-    echo "$encryption_config" > "$client_encryption_info_file"
-    echo "${public_key}|${sni}|${short_id}" > "$client_reality_info_file"
+    mkdir -p /var/log/xray
+    chown xray:xray /var/log/xray
+    chmod 700 /var/log/xray
+    tmp_config=$(mktemp "${xray_config_path}.tmp.XXXXXX") || return 1
 
-    jq -n \
+    if ! jq -n \
         --argjson port "$port" \
         --arg uuid "$uuid" \
         --arg decryption "$decryption_config" \
@@ -618,7 +670,8 @@ write_config() {
         --arg flow "xtls-rprx-vision" \
     '{
         "log": {
-            "loglevel": "warning"
+            "loglevel": "warning",
+            "error": "/var/log/xray/error.log"
         },
         "inbounds": [{
             "listen": "::",
@@ -651,11 +704,35 @@ write_config() {
                 "domainStrategy": "UseIPv4v6"
             }
         }]
-    }' > "$xray_config_path"
+    }' > "$tmp_config"; then
+        rm -f "$tmp_config"
+        error "生成配置文件失败"
+        return 1
+    fi
+
+    if ! "$xray_binary_path" run -test -config "$tmp_config"; then
+        rm -f "$tmp_config"
+        error "Xray 配置检查不通过，旧配置未覆盖"
+        return 1
+    fi
+    if ! chown root:xray "$tmp_config" || ! chmod 640 "$tmp_config"; then
+        rm -f "$tmp_config"
+        error "设置 Xray 配置权限失败"
+        return 1
+    fi
+    if [ -f "$xray_config_path" ]; then
+        cp -p "$xray_config_path" "${xray_config_path}.bak" || { rm -f "$tmp_config"; return 1; }
+    fi
+    mv -f "$tmp_config" "$xray_config_path"
+    printf '%s\n' "$encryption_config" > "$client_encryption_info_file"
+    printf '%s\n' "${public_key}|${sni}|${short_id}" > "$client_reality_info_file"
+    chmod 600 "$client_encryption_info_file" "$client_reality_info_file"
 }
+
 
 run_install() {
     local port="$1" uuid="$2" sni="$3" short_id="$4"
+    if ! validate_node_inputs "$port" "$uuid" "$sni" "$short_id"; then return 1; fi
 
     info "正在下载并安装 Xray 核心..."
     if ! execute_official_script install; then
@@ -663,8 +740,10 @@ run_install() {
         exit 1
     fi
 
-    info "正在安装/更新 Geo 数据文件..."
-    execute_official_script install-geodata
+    info "正在尝试更新 Geo 数据文件..."
+    if ! execute_official_script update-geodata; then
+        info "Geo 扩展数据更新失败，继续使用官方自带的 Geo 数据。"
+    fi
 
     if ! check_xray_version; then
         error "安装的 Xray 版本不支持所需功能！"
@@ -695,14 +774,16 @@ run_install() {
     public_key=$(echo "$reality_keys" | cut -d'|' -f2)
 
     info "正在写入 Xray 配置文件..."
-    write_config "$port" "$uuid" "$decryption_config" "$encryption_config" "$private_key" "$public_key" "$sni" "$short_id"
+    if ! write_config "$port" "$uuid" "$decryption_config" "$encryption_config" "$private_key" "$public_key" "$sni" "$short_id"; then return 1; fi
 
     if ! restart_xray; then
         exit 1
     fi
 
     success "Xray 安装/配置成功！"
-    view_subscription_info
+    if ! view_subscription_info; then
+        info "服务已启动，但暂时无法自动获取公网地址，请检查网络后通过菜单8查看订阅。"
+    fi
 }
 
 press_any_key_to_continue() {
@@ -743,7 +824,7 @@ main_menu() {
             5) uninstall_xray ;;
             6) view_xray_log; needs_pause=false ;;
             7) modify_config ;;
-            8) view_subscription_info ;;
+            8) view_subscription_info || true ;;
             0) success "感谢使用！"; exit 0 ;;
             *) error "无效选项。" ;;
         esac
@@ -765,6 +846,7 @@ show_help() {
     echo "  --port <端口>      # 监听端口 (默认: 443)"
     echo "  --uuid <UUID>      # 用户UUID (默认: 自动生成)"
     echo "  --sni <域名>       # REALITY SNI (默认: learn.microsoft.com)"
+    echo "  --short-id <HEX>  # REALITY Short ID (默认: 20220701)"
     echo "  --quiet, -q        # 静默模式，成功后仅输出订阅链接"
     echo
     echo "示例:"
@@ -783,9 +865,10 @@ main() {
 
         while [ $# -gt 0 ]; do
             case "$1" in
-                --port) port="$2"; shift 2 ;;
-                --uuid) uuid="$2"; shift 2 ;;
-                --sni) sni="$2"; shift 2 ;;
+                --port) port="${2:?--port 缺少值}"; shift 2 ;;
+                --uuid) uuid="${2:?--uuid 缺少值}"; shift 2 ;;
+                --sni) sni="${2:?--sni 缺少值}"; shift 2 ;;
+                --short-id) short_id="${2:?--short-id 缺少值}"; shift 2 ;;
                 --quiet | -q) is_quiet=true; shift ;;
                 *) error "未知参数: $1"; exit 1 ;;
             esac
@@ -796,16 +879,13 @@ main() {
             uuid=$(generate_uuid)
         fi
 
-        if ! is_valid_port "$port"; then
-            error "提供的端口 '$port' 无效。"
-            exit 1
-        fi
+        if ! validate_node_inputs "$port" "$uuid" "$sni" "$short_id"; then exit 1; fi
 
         info "开始静默安装..."
         info "  端口: $port"
         info "  UUID: $uuid"
         info "  SNI: $sni"
-        info "  Short ID: (使用默认值) $short_id"
+        info "  Short ID: $short_id"
         run_install "$port" "$uuid" "$sni" "$short_id"
     else
         main_menu
