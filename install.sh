@@ -441,12 +441,16 @@ restart_xray() {
         error "Xray 没有保持运行，请检查配置和日志"
         return 1
     fi
+    if command -v rc-service >/dev/null 2>&1 && [ -f "$standard_xray_service_path" ] && rc-service xray-standard status >/dev/null 2>&1; then
+        rc-service xray-standard restart || { error "普通 VLESS 兼容服务重启失败"; return 1; }
+    fi
     success "Xray 已运行，并已设置开机自启"
 }
 
 
 stop_xray() {
     if [ ! -x "$xray_binary_path" ]; then error "Xray 未安装。"; return 1; fi
+    if command -v rc-service >/dev/null 2>&1 && rc-service xray-standard status >/dev/null 2>&1; then rc-service xray-standard stop || return 1; fi
     if ! service_is_active xray; then success "Xray 已停止"; return 0; fi
     if command -v rc-service >/dev/null 2>&1; then
         if ! rc-service xray stop; then error "OpenRC 停止失败"; return 1; fi
@@ -456,6 +460,7 @@ stop_xray() {
         error "没有可用的服务管理器"
         return 1
     fi
+    if command -v rc-service >/dev/null 2>&1 && rc-service xray-standard status >/dev/null 2>&1; then rc-service xray-standard stop || return 1; fi
     success "Xray 已停止"
 }
 
@@ -476,6 +481,10 @@ uninstall_xray() {
         fi
         rc-update del xray default >/dev/null 2>&1 || true
         rm -f /etc/init.d/xray /etc/logrotate.d/xray "$xray_binary_path"
+        rc-service xray-standard stop >/dev/null 2>&1 || true
+        rc-update del xray-standard default >/dev/null 2>&1 || true
+        rm -f "$standard_xray_service_path" "$standard_xray_binary_path"
+        rm -rf "$standard_xray_config_dir" /usr/local/share/xray-standard "$standard_xray_log_dir"
         rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
     else
         if ! execute_official_script remove --purge; then
@@ -484,6 +493,7 @@ uninstall_xray() {
         fi
     fi
     rm -f "$client_vless_link_file" "$client_encryption_info_file" "$client_reality_info_file"
+    rm -f "$HOME"/.xray-standard-*.info "$HOME"/xray_standard_*.txt
     success "Xray 已卸载；系统依赖及专用系统用户保留"
 }
 
@@ -949,7 +959,7 @@ run_add_standard() {
     local existing_standard=false
 
     if ! validate_node_inputs "$port" "$uuid" "$sni" "$sid"; then return 1; fi
-    if [ "\${#sid}" -gt 8 ]; then
+    if [ "${#sid}" -gt 8 ]; then
         error "sing-box 1.13 Short ID 最多8位十六进制字符"
         return 1
     fi
@@ -978,8 +988,8 @@ run_add_standard() {
 
     if [ "$existing_standard" != true ]; then
         if ! keys=$(generate_reality_keys "$standard_xray_binary_path"); then return 1; fi
-        private_key="\${keys%%|*}"
-        public_key="\${keys#*|}"
+        private_key="${keys%%|*}"
+        public_key="${keys#*|}"
     fi
     if [ -z "$public_key" ]; then
         error "缺少普通节点公钥，无法安全迁移；请确认原节点的 .xray-standard-$port.info 文件是否存在。"
@@ -1022,7 +1032,7 @@ run_add_standard() {
     # If migrating from the main config, remove only this standard inbound and keep all other inbounds untouched.
     if [ "$existing_standard" = true ]; then
         local main_tmp
-        main_tmp=$(mktemp "\${xray_config_path}.tmp.XXXXXX") || return 1
+        main_tmp=$(mktemp "${xray_config_path}.tmp.XXXXXX") || return 1
         if jq --argjson p "$port" '.inbounds |= map(select(.port != $p))' "$xray_config_path" > "$main_tmp"; then
             chown root:xray "$main_tmp" && chmod 640 "$main_tmp" && cp -p "$xray_config_path" "$xray_config_path.bak" && mv -f "$main_tmp" "$xray_config_path"
             if ! restart_xray; then
@@ -1077,7 +1087,7 @@ view_standard_subscription() {
     [ -f "$info_file" ] || { error "端口 $port 缺少客户端公钥信息"; return 1; }
     [ -f "$xray_config_path" ] || return 1
     IFS='|' read -r public sni sid < "$info_file"
-    uuid=$(jq -r --argjson port "$port" '.inbounds[] | select(.port == $port) | .settings.clients[0].id' "$xray_config_path")
+    uuid=$(jq -r --argjson port "$port" '.inbounds[] | select(.port == $port) | .settings.clients[0].id' "$standard_xray_config_path")
     [ -n "$uuid" ] && [ "$uuid" != "null" ] || return 1
     ip=$(get_public_ip_v4)
     [ -n "$ip" ] || ip=$(get_public_ip_v6)
@@ -1102,7 +1112,7 @@ view_all_subscriptions() {
         port="${port#.xray-standard-}"
         port="${port%.info}"
         if [[ "$port" =~ ^[0-9]+$ ]] && jq -e --argjson port "$port" \
-          'any(.inbounds[]?; .port == $port and .settings.decryption == "none")' "$xray_config_path" >/dev/null 2>&1; then
+          'any(.inbounds[]?; .port == $port and .settings.decryption == "none")' "$standard_xray_config_path" >/dev/null 2>&1; then
             view_standard_subscription "$port" || true
         fi
     done
