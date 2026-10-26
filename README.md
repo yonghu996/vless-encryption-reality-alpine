@@ -22,6 +22,18 @@ netstat -lnt | grep ':12345'
 
 最后一个命令中的 12345 请替换为自己设置的端口，同时在主机防火墙或云厂商安全组允许相应的 TCP 入站流量。
 
+## sing-box 1.13.11 普通 VLESS 节点（不启用 VLESS Encryption）
+
+现有加密节点默认保留。新版主菜单选择 **9** 创建独立的普通 VLESS + REALITY + Vision 入站（推荐使用不同端口，例如原 12773、新 12774）；菜单 **8** 查看所有节点链接。已有配置会先备份，新增配置校验失败时不会覆盖原节点。
+
+```sh
+bash /root/xray-menu.sh install --mode standard --port 12774 --sni bing.com
+```
+
+普通节点的服务端 `settings.decryption` 必须是 `"none"`，分享链接为 `encryption=none`，不包含 ML-KEM-768 公钥；原有加密节点不变。导出的普通节点链接保存在 root 家目录的 `xray_standard_端口.txt`。导出仍包含节点凭据，请勿公开传播。
+
+**重要：** 目前菜单 1 和 7 仍是针对原加密节点的维护操作，会替换整个配置，可能删除追加的普通节点。为保留全部入站，请只使用菜单 9 新增普通节点，切勿通过菜单 1/7 维护混合配置；此限制将在后续版本解除。
+
 ## 无交互安装
 
 ```sh
@@ -43,6 +55,13 @@ bash /root/xray-menu.sh install --port 12345 --sni www.sega.com
 ## 发布说明（Releases）
 
 每次版本升级须同步修改 `SCRIPT_VERSION`、新增 `releases/vX.Y.Z.md` 更新说明，并推送同名 `vX.Y.Z` Git 标签。仓库内的 `.github/workflows/release.yml` 将自动执行测试，测试通过后发布 [GitHub Releases](https://github.com/yonghu996/vless-encryption-reality-alpine/releases)。不要仅修改 README 而不发布对应 Release。
+
+## v1.8.0 — sing-box 兼容模式
+
+- 增加不带 VLESS Encryption 的普通 VLESS + REALITY + Vision 入站。
+- 支持菜单 9 和命令行 `--mode standard`，保留已有加密节点并使用独立端口。
+- 客户端分享链接 `encryption=none`，自动保存普通节点的公钥信息；菜单 8 展示两种节点。
+- 新增 `tests/test_standard_vless.sh` 回归测试。已进行静态和配置结构校验，真实 Alpine 服务与 sing-box 端到端握手尚待验收。
 
 ## v1.7.5 修复
 
