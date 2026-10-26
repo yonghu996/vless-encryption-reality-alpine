@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # VLESS Encryption + REALITY 一键安装管理脚本
-# 版本: V1.7.3 (Xray 26.10.21 REALITY 密钥兼容)
+# 版本: V1.7.4 (Xray 临时 JSON 配置校验修复)
 # 固定配置: VLESS Encryption (native + 0-RTT + ML-KEM-768) + REALITY + xtls-rprx-vision
 
 set -eo pipefail
 umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.7.3"
+SCRIPT_VERSION="1.7.4"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 
@@ -660,7 +660,15 @@ write_config() {
     mkdir -p /var/log/xray
     chown xray:xray /var/log/xray
     chmod 700 /var/log/xray
+    # Xray's external config loader requires the filename to end in .json.
+    # -format=json alone does not override its extension check.
     tmp_config=$(mktemp "${xray_config_path}.tmp.XXXXXX") || return 1
+    if ! mv -f "$tmp_config" "${tmp_config}.json"; then
+        rm -f "$tmp_config"
+        error "无法创建临时 JSON 配置文件"
+        return 1
+    fi
+    tmp_config="${tmp_config}.json"
 
     if ! jq -n \
         --argjson port "$port" \

@@ -40,11 +40,21 @@ bash /root/xray-menu.sh install --port 12345 --sni www.sega.com
 
 在 Alpine 上使用 OpenRC 管理 Xray，自动设置开机启动；卸载会删除 Xray 程序、配置及日志，必须手动输入 `yes` 确认。修改配置会重新生成 VLESS Encryption 及 REALITY 密钥，旧客户端链接将失效。
 
+## 发布说明（Releases）
+
+每次版本升级须同步修改 `SCRIPT_VERSION`、新增 `releases/vX.Y.Z.md` 更新说明，并推送同名 `vX.Y.Z` Git 标签。仓库内的 `.github/workflows/release.yml` 将自动执行测试，测试通过后发布 [GitHub Releases](https://github.com/yonghu996/vless-encryption-reality-alpine/releases)。不要仅修改 README 而不发布对应 Release。
+
+## v1.7.4 修复
+
+- 解决 Xray `unsupported config file extension`：临时配置文件保留 `.json` 后缀。
+- 为临时文件扩展名新增检查，并配置标签触发的 GitHub Releases 自动发布流程。
+- 历史更新记录存放在 `releases/` 文件夹。
+
 ## v1.7.3 修复
 
 - 兼容 Xray 26.10.21 的 `Password (PublicKey):` REALITY 公钥标签，同时保留对旧标签的支持。
 - 对密钥输出执行格式校验，异常情况明确失败而非写入损坏配置。
-- 临时配置检查显式指定 `-format=json`，避免临时文件无 `.json` 后缀导致检查失败。
+- 临时配置检查显式指定 `-format=json`（仅指定格式不足以解决临时文件扩展名问题，已在 v1.7.4 修复）。
 - 增加 `tests/test_reality_keys.sh` 回归测试，用法：`bash tests/test_reality_keys.sh`。
 
 ## v1.7.2 修复
