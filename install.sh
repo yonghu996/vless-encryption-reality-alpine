@@ -1,16 +1,25 @@
 #!/bin/bash
 
 # VLESS Encryption / Standard VLESS + REALITY + Vision 管理脚本
-# 版本: V1.8.1 (修复普通节点展示与运行校验)
+# 版本: V1.8.2 (sing-box 1.13 REALITY 兼容服务)
 # 可选配置: VLESS Encryption (ML-KEM-768) 或 Standard VLESS + REALITY + Vision
 
 set -eo pipefail
 umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.8.1"
+SCRIPT_VERSION="1.8.2"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
+standard_xray_binary_path="/usr/local/bin/xray-standard"
+standard_xray_wrapper_path="/usr/local/bin/xray-standard-wrapper"
+standard_xray_config_dir="/usr/local/etc/xray-standard"
+standard_xray_config_path="/usr/local/etc/xray-standard/config.json"
+standard_xray_log_dir="/var/log/xray-standard"
+standard_xray_service_path="/etc/init.d/xray-standard"
+standard_xray_systemd_path="/etc/systemd/system/xray-standard.service"
+standard_xray_asset_base="https://github.com/yonghu996/vless-encryption-reality-alpine/releases/latest/download"
+standard_xray_build_id="xray-26.10.21-reality-legacy-keyshare-v1"
 
 # 存放客户端配置信息的文件
 client_encryption_info_file=~/xray_encryption_info.txt
@@ -298,15 +307,13 @@ generate_vless_encryption_config() {
 
 generate_reality_keys() {
     info "正在生成 REALITY 密钥对..."
-    local key_pair private_key public_key
+    local binary="${1:-$xray_binary_path}" key_pair private_key public_key
 
-    if ! key_pair=$("$xray_binary_path" x25519 2>/dev/null); then
+    if ! key_pair=$("$binary" x25519 2>/dev/null); then
         error "Xray x25519 命令执行失败，无法生成 REALITY 密钥。"
         return 1
     fi
 
-    # Xray 26.10.21: "PrivateKey: ..." / "Password (PublicKey): ..."
-    # Also accept older Xray labels: "Password:", "PublicKey:", "Private key:" and "Public key:".
     private_key=$(printf '%s\n' "$key_pair" |
         awk -F':[[:space:]]*' '/^[[:space:]]*(PrivateKey|Private key):/ { print $2; exit }' |
         tr -d '[:space:]')
@@ -314,8 +321,6 @@ generate_reality_keys() {
         awk -F':[[:space:]]*' '/^[[:space:]]*(Password \(PublicKey\)|Password|PublicKey|Public key):/ { print $2; exit }' |
         tr -d '[:space:]')
 
-    # Xray defaults to raw URL-safe Base64 for 32-byte X25519 keys (43 characters).
-    # Fail closed on changed or unexpected output instead of writing broken JSON.
     if [[ ! "$private_key" =~ ^[A-Za-z0-9_-]{43}$ ]] ||
        [[ ! "$public_key" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
         error "无法解析 REALITY 密钥对：Xray x25519 输出字段/密钥格式不符合预期。"
@@ -323,6 +328,7 @@ generate_reality_keys() {
     fi
     printf '%s|%s\n' "$private_key" "$public_key"
 }
+
 
 
 install_xray() {
