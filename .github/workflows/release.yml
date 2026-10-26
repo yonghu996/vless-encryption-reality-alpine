@@ -1,0 +1,41 @@
+name: Test and Release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax and regression tests
+        run: |
+          bash -n install.sh
+          bash tests/test_reality_keys.sh
+          bash tests/test_config_temp_suffix.sh
+      - name: Check tag matches script version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' install.sh)
+          test "v$version" = "${GITHUB_REF_NAME}"
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release create "$VERSION" --verify-tag --title "$VERSION" --notes-file "releases/$VERSION.md"
+          fi
