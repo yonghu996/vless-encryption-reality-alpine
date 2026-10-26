@@ -56,6 +56,13 @@ bash /root/xray-menu.sh install --port 12345 --sni www.sega.com
 
 每次版本升级须同步修改 `SCRIPT_VERSION`、新增 `releases/vX.Y.Z.md` 更新说明，并推送同名 `vX.Y.Z` Git 标签。仓库内的 `.github/workflows/release.yml` 将自动执行测试，测试通过后发布 [GitHub Releases](https://github.com/yonghu996/vless-encryption-reality-alpine/releases)。不要仅修改 README 而不发布对应 Release。
 
+## v1.8.2 — sing-box 1.13.x REALITY 兼容服务
+
+- 普通 VLESS 节点使用独立的 Xray v25.9.11 服务与 OpenRC 服务 `xray-standard`，避免改变主 Xray 核心。
+- 菜单 9 会迁移此前写入主配置的普通节点，尽可能保留凭据；菜单 8 从独立配置读取普通节点。
+- 兼容服务使用独立配置、日志和二进制。端口冲突时拒绝迁移，主节点配置有备份。
+- 需在真实 Alpine 与 sing-box 1.13.11 环境完成连接验收后，才能确认兼容性。
+
 ## v1.8.1 — 节点列表修复
 
 - 修复菜单 8 中 Bash 变量转义导致普通节点无法显示的问题；不改变已建节点。
