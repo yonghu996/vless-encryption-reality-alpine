@@ -975,10 +975,11 @@ run_add_standard() {
         return 1
     fi
     rm -rf -- "$stage_dir"
+    # Per-port metadata for the new public key; never overwrite encrypted-node metadata.
+    printf '%s|%s|%s\n' "${keys#*|}" "$sni" "$sid" > "$HOME/.xray-standard-$port.info"
+    chmod 600 "$HOME/.xray-standard-$port.info"
     success "普通 VLESS + REALITY + Vision 节点添加成功（端口 $port）"
-    if ! view_subscription_info; then
-        info "节点已添加，但暂时无法获取公网 IP，稍后通过菜单 8 查看链接。"
-    fi
+    view_standard_subscription "$port" || true
 }
 
 add_standard_interactive() {
@@ -1001,6 +1002,45 @@ add_standard_interactive() {
     read -r sid
     [ -z "$sid" ] && sid="20220701"
     run_add_standard "$port" "$uuid" "$sni" "$sid"
+}
+
+
+view_standard_subscription() {
+    local port="$1" info_file="$HOME/.xray-standard-$1.info"
+    local public sni sid uuid ip url host
+    [ -f "$info_file" ] || { error "端口 $port 缺少客户端公钥信息"; return 1; }
+    [ -f "$xray_config_path" ] || return 1
+    IFS='|' read -r public sni sid < "$info_file"
+    uuid=$(jq -r --argjson port "$port" '.inbounds[] | select(.port == $port) | .settings.clients[0].id' "$xray_config_path")
+    [ -n "$uuid" ] && [ "$uuid" != "null" ] || return 1
+    ip=$(get_public_ip_v4)
+    [ -n "$ip" ] || ip=$(get_public_ip_v6)
+    [ -n "$ip" ] || { error "无法获取公网IP"; return 1; }
+    host="$ip"
+    [[ "$ip" == *:* ]] && host="[$ip]"
+    url="vless://$uuid@$host:$port?encryption=none&security=reality&sni=$sni&sid=$sid&fp=chrome&pbk=$public&flow=xtls-rprx-vision&type=tcp#$(hostname)-standard-$port"
+    printf '\n普通 VLESS (sing-box 兼容) 端口 %s:\n%s\n' "$port" "$url"
+    printf '%s\n' "$url" > "$HOME/xray_standard_$port.txt"
+    chmod 600 "$HOME/xray_standard_$port.txt"
+}
+
+view_all_subscriptions() {
+    local port
+    # Existing encrypted node: retain legacy export behavior.
+    if [ -f "$client_encryption_info_file" ] && [ -f "$client_reality_info_file" ]; then
+        view_subscription_info || true
+    fi
+    shopt -s nullglob
+    for f in "$HOME"/.xray-standard-*.info; do
+        port="\${f##*/}"
+        port="\${port#.xray-standard-}"
+        port="\${port%.info}"
+        if [[ "$port" =~ ^[0-9]+$ ]] && jq -e --argjson port "$port" \
+          'any(.inbounds[]?; .port == $port and .settings.decryption == "none")' "$xray_config_path" >/dev/null 2>&1; then
+            view_standard_subscription "$port" || true
+        fi
+    done
+    shopt -u nullglob
 }
 
 press_any_key_to_continue() {
@@ -1026,10 +1066,11 @@ main_menu() {
         cecho "$C_PURPLE" "  6. 查看 Xray 日志"
         cecho "$C_PURPLE" "  7. 修改节点配置"
         cecho "$C_PURPLE" "  8. 查看订阅信息"
+        cecho "$C_PURPLE" "  9. 新增普通 VLESS + REALITY + Vision（sing-box兼容）"
         cecho "$C_GREEN"  "────────────────────────────────────────────────────────"
         cecho "$C_RED"    "  0. 退出脚本"
         cecho "$C_GREEN"  "────────────────────────────────────────────────────────"
-        echo -n "  请输入选项 [0-8]: "
+        echo -n "  请输入选项 [0-9]: "
         read -r choice
 
         local needs_pause=true
@@ -1041,7 +1082,8 @@ main_menu() {
             5) uninstall_xray ;;
             6) view_xray_log; needs_pause=false ;;
             7) modify_config ;;
-            8) view_subscription_info || true ;;
+            8) view_all_subscriptions || true ;;
+            9) add_standard_interactive ;;
             0) success "感谢使用！"; exit 0 ;;
             *) error "无效选项。" ;;
         esac
@@ -1064,6 +1106,7 @@ show_help() {
     echo "  --uuid <UUID>      # 用户UUID (默认: 自动生成)"
     echo "  --sni <域名>       # REALITY SNI (默认: learn.microsoft.com)"
     echo "  --short-id <HEX>  # REALITY Short ID (默认: 20220701)"
+    echo "  --mode <模式>      # encrypted (默认) 或 standard (sing-box)"
     echo "  --quiet, -q        # 静默模式，成功后仅输出订阅链接"
     echo
     echo "示例:"
@@ -1079,6 +1122,7 @@ main() {
         local uuid=""
         local sni="learn.microsoft.com"
         local short_id="20220701" # 始终使用默认值
+        local mode="encrypted"
 
         while [ $# -gt 0 ]; do
             case "$1" in
@@ -1086,6 +1130,7 @@ main() {
                 --uuid) uuid="${2:?--uuid 缺少值}"; shift 2 ;;
                 --sni) sni="${2:?--sni 缺少值}"; shift 2 ;;
                 --short-id) short_id="${2:?--short-id 缺少值}"; shift 2 ;;
+                --mode) mode="${2:?--mode 缺少值}"; shift 2 ;;
                 --quiet | -q) is_quiet=true; shift ;;
                 *) error "未知参数: $1"; exit 1 ;;
             esac
@@ -1103,7 +1148,11 @@ main() {
         info "  UUID: $uuid"
         info "  SNI: $sni"
         info "  Short ID: $short_id"
-        run_install "$port" "$uuid" "$sni" "$short_id"
+        case "$mode" in
+            encrypted) run_install "$port" "$uuid" "$sni" "$short_id" ;;
+            standard) run_add_standard "$port" "$uuid" "$sni" "$short_id" ;;
+            *) error "mode 必须为 encrypted 或 standard"; return 1 ;;
+        esac
     else
         main_menu
     fi
