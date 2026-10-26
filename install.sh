@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # VLESS Encryption + REALITY 一键安装管理脚本
-# 版本: V1.7.2 (Alpine/OpenRC 修复)
+# 版本: V1.7.3 (Xray 26.10.21 REALITY 密钥兼容)
 # 固定配置: VLESS Encryption (native + 0-RTT + ML-KEM-768) + REALITY + xtls-rprx-vision
 
 set -eo pipefail
 umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.7.2"
+SCRIPT_VERSION="1.7.3"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 
@@ -297,30 +297,32 @@ generate_vless_encryption_config() {
 
 generate_reality_keys() {
     info "正在生成 REALITY 密钥对..."
-    local key_pair
-    key_pair=$($xray_binary_path x25519 2>/dev/null)
-    if [ -z "$key_pair" ]; then
-        error "生成 REALITY 密钥对失败！"
+    local key_pair private_key public_key
+
+    if ! key_pair=$("$xray_binary_path" x25519 2>/dev/null); then
+        error "Xray x25519 命令执行失败，无法生成 REALITY 密钥。"
         return 1
     fi
 
-    local private_key
-    private_key=$(echo "$key_pair" | awk '/PrivateKey:/ {print $2}')
-    local public_key
-    public_key=$(echo "$key_pair" | awk '/Password:/ {print $2}')
+    # Xray 26.10.21: "PrivateKey: ..." / "Password (PublicKey): ..."
+    # Also accept older Xray labels: "Password:", "PublicKey:", "Private key:" and "Public key:".
+    private_key=$(printf '%s\n' "$key_pair" |
+        awk -F':[[:space:]]*' '/^[[:space:]]*(PrivateKey|Private key):/ { print $2; exit }' |
+        tr -d '[:space:]')
+    public_key=$(printf '%s\n' "$key_pair" |
+        awk -F':[[:space:]]*' '/^[[:space:]]*(Password \(PublicKey\)|Password|PublicKey|Public key):/ { print $2; exit }' |
+        tr -d '[:space:]')
 
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        info "尝试使用旧版格式解析密钥..."
-        private_key=$(echo "$key_pair" | awk '/Private key:/ {print $3}')
-        public_key=$(echo "$key_pair" | awk '/Public key:/ {print $3}')
-    fi
-
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        error "无法解析 REALITY 密钥对！"
+    # Xray defaults to raw URL-safe Base64 for 32-byte X25519 keys (43 characters).
+    # Fail closed on changed or unexpected output instead of writing broken JSON.
+    if [[ ! "$private_key" =~ ^[A-Za-z0-9_-]{43}$ ]] ||
+       [[ ! "$public_key" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+        error "无法解析 REALITY 密钥对：Xray x25519 输出字段/密钥格式不符合预期。"
         return 1
     fi
-    echo "${private_key}|${public_key}"
+    printf '%s|%s\n' "$private_key" "$public_key"
 }
+
 
 install_xray() {
     if [ -f "$xray_binary_path" ]; then
@@ -710,7 +712,7 @@ write_config() {
         return 1
     fi
 
-    if ! "$xray_binary_path" run -test -config "$tmp_config"; then
+    if ! "$xray_binary_path" run -test -format=json -config "$tmp_config"; then
         rm -f "$tmp_config"
         error "Xray 配置检查不通过，旧配置未覆盖"
         return 1
@@ -893,9 +895,11 @@ main() {
 }
 
 # --- 脚本入口 ---
-if [ $# -gt 0 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
-    show_help
-    exit 0
+# Sourcing the script is supported for parser regression tests.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [ $# -gt 0 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
+        show_help
+        exit 0
+    fi
+    main "$@"
 fi
-
-main "$@"
