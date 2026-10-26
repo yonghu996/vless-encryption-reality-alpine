@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# VLESS Encryption + REALITY 一键安装管理脚本
-# 版本: V1.7.5 (Xray 日志权限与 OpenRC 启动修复)
-# 固定配置: VLESS Encryption (native + 0-RTT + ML-KEM-768) + REALITY + xtls-rprx-vision
+# VLESS Encryption / Standard VLESS + REALITY + Vision 管理脚本
+# 版本: V1.8.0 (新增 sing-box 兼容普通 VLESS 节点)
+# 可选配置: VLESS Encryption (ML-KEM-768) 或 Standard VLESS + REALITY + Vision
 
 set -eo pipefail
 umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.7.5"
+SCRIPT_VERSION="1.8.0"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 
@@ -690,6 +690,12 @@ write_config() {
     local port="$1" uuid="$2" decryption_config="$3" encryption_config="$4"
     local private_key="$5" public_key="$6" sni="$7" short_id="$8"
     local tmp_config
+    # Prevent legacy menu 1/7 from erasing additional standard inbounds.
+    if [ -f "$xray_config_path" ] &&
+       jq -e '(.inbounds | length) > 1 or any(.inbounds[]?; .settings.decryption == "none")' "$xray_config_path" >/dev/null 2>&1; then
+        error "当前包含普通/多个 VLESS 节点；旧菜单 1/7 会覆盖它们，已拒绝此操作。"
+        return 1
+    fi
 
     if ! prepare_xray_log_permissions; then return 1; fi
     # Xray's external config loader requires the filename to end in .json.
@@ -833,6 +839,216 @@ run_install() {
     fi
 }
 
+
+# 追加独立普通 VLESS 入站，不触碰已有 Encryption 节点。
+build_standard_inbound() {
+    local port="$1" uuid="$2" sni="$3" sid="$4" private_key="$5"
+    jq -n \
+        --argjson port "$port" --arg uuid "$uuid" \
+        --arg sni "$sni" --arg sid "$sid" --arg private_key "$private_key" \
+    '{
+        tag: ("vless-standard-" + ($port | tostring)),
+        listen: "::", port: $port, protocol: "vless",
+        settings: {
+            clients: [{id: $uuid, flow: "xtls-rprx-vision"}],
+            decryption: "none"
+        },
+        streamSettings: {
+            network: "tcp", security: "reality",
+            realitySettings: {
+                show: false, dest: ($sni + ":443"), xver: 0,
+                serverNames: [$sni], privateKey: $private_key,
+                shortIds: [$sid]
+            }
+        }
+    }'
+}
+
+ensure_standard_prerequisites() {
+    if [ ! -x "$xray_binary_path" ]; then
+        info "Xray 尚未安装，先安装官方核心..."
+        if ! execute_official_script install; then return 1; fi
+    fi
+    if ! check_xray_version; then
+        error "本机 Xray 不支持 VLESS/REALITY，请先更新核心。"
+        return 1
+    fi
+    prepare_xray_log_permissions
+}
+
+# 分别在隔离的临时目录中创建和验证配置；失败回滚已存在的节点。
+run_add_standard() {
+    local port="$1" uuid="$2" sni="$3" sid="$4"
+    local config_dir stage_dir candidate inbound_json keys private_key
+    local previous_exists=false
+
+    if ! validate_node_inputs "$port" "$uuid" "$sni" "$sid"; then return 1; fi
+    if [ "${#sid}" -gt 8 ]; then
+        error "sing-box 兼容模式 Short ID 最多8位十六进制字符（推荐默认20220701）。"
+        return 1
+    fi
+    if ! ensure_standard_prerequisites; then return 1; fi
+
+    config_dir=$(dirname "$xray_config_path")
+    if ! install -d -m 750 -o root -g xray "$config_dir"; then
+        error "无法准备 Xray 配置目录"
+        return 1
+    fi
+    if [ -f "$xray_config_path" ]; then
+        if ! jq -e '.inbounds | type == "array"' "$xray_config_path" >/dev/null 2>&1; then
+            error "现有配置没有 inbounds 数组或 JSON 无效，拒绝覆盖。"
+            return 1
+        fi
+        if jq -e --arg port "$port" \
+            'any(.inbounds[]; (.port | tostring) == $port)' "$xray_config_path" >/dev/null; then
+            error "端口 $port 已被 Xray 节点使用，请换一个端口。"
+            return 1
+        fi
+    fi
+
+    if ! keys=$(generate_reality_keys); then return 1; fi
+    private_key="${keys%%|*}"
+    if ! inbound_json=$(build_standard_inbound "$port" "$uuid" "$sni" "$sid" "$private_key"); then
+        error "生成普通 VLESS 入站配置失败"
+        return 1
+    fi
+
+    # 子目录内的 config.json 避免被 Xray 的 -confdir 误加载为第二个活动文件。
+    stage_dir=$(mktemp -d "$config_dir/.xray-stage.XXXXXX") || return 1
+    candidate="$stage_dir/config.json"
+    if ! chown root:xray "$stage_dir" || ! chmod 750 "$stage_dir"; then
+        rm -rf -- "$stage_dir"
+        return 1
+    fi
+    if [ -f "$xray_config_path" ]; then
+        previous_exists=true
+        if ! cp -p "$xray_config_path" "$stage_dir/previous.json" ||
+           ! jq --argjson inbound "$inbound_json" \
+              '.inbounds += [$inbound]' "$xray_config_path" > "$candidate"; then
+            rm -rf -- "$stage_dir"
+            error "追加节点配置失败，原配置未变更"
+            return 1
+        fi
+    else
+        if ! jq -n --argjson inbound "$inbound_json" '{
+            log: {loglevel: "warning", error: "/var/log/xray/error.log"},
+            inbounds: [$inbound],
+            outbounds: [{
+                protocol: "freedom", settings: {},
+                streamSettings: {sockopt: {domainStrategy: "UseIPv4v6"}}
+            }]
+        }' > "$candidate"; then
+            rm -rf -- "$stage_dir"
+            error "生成初始 Xray 配置失败"
+            return 1
+        fi
+    fi
+
+    if ! chown root:xray "$candidate" || ! chmod 640 "$candidate"; then
+        rm -rf -- "$stage_dir"
+        error "临时配置权限设置失败"
+        return 1
+    fi
+    if ! su -s /bin/sh -c \
+       "XRAY_LOCATION_ASSET=/usr/local/share/xray $xray_binary_path run -test -format=json -config $candidate" xray; then
+        rm -rf -- "$stage_dir"
+        error "普通 VLESS 配置校验失败，原配置未变更"
+        return 1
+    fi
+
+    if [ "$previous_exists" = true ]; then
+        if ! cp -p "$xray_config_path" "${xray_config_path}.bak"; then
+            rm -rf -- "$stage_dir"
+            error "原配置备份失败，拒绝更新"
+            return 1
+        fi
+    fi
+    if ! mv -f "$candidate" "$xray_config_path"; then
+        rm -rf -- "$stage_dir"
+        error "写入配置失败"
+        return 1
+    fi
+
+    if ! restart_xray; then
+        error "服务启动失败，尝试回滚..."
+        if [ "$previous_exists" = true ]; then
+            cp -p "$stage_dir/previous.json" "$xray_config_path" || true
+            restart_xray || true
+        else
+            rm -f "$xray_config_path"
+        fi
+        rm -rf -- "$stage_dir"
+        return 1
+    fi
+    rm -rf -- "$stage_dir"
+    # Per-port metadata for the new public key; never overwrite encrypted-node metadata.
+    printf '%s|%s|%s\n' "${keys#*|}" "$sni" "$sid" > "$HOME/.xray-standard-$port.info"
+    chmod 600 "$HOME/.xray-standard-$port.info"
+    success "普通 VLESS + REALITY + Vision 节点添加成功（端口 $port）"
+    view_standard_subscription "$port" || true
+}
+
+add_standard_interactive() {
+    local port uuid sni sid
+    echo "新增普通 VLESS + REALITY + Vision 节点（兼容 sing-box，不启用 VLESS Encryption）"
+    echo "已有节点会保留，请选择一个未使用的 TCP 端口。"
+    echo -n "监听端口（默认: 443）: "
+    read -r port
+    [ -z "$port" ] && port=443
+    echo -n "UUID（留空自动生成）: "
+    read -r uuid
+    if [ -z "$uuid" ]; then
+        uuid=$(generate_uuid)
+        info "已生成 UUID: $uuid"
+    fi
+    echo -n "REALITY SNI（默认: learn.microsoft.com）: "
+    read -r sni
+    [ -z "$sni" ] && sni="learn.microsoft.com"
+    echo -n "REALITY Short ID（默认: 20220701）: "
+    read -r sid
+    [ -z "$sid" ] && sid="20220701"
+    run_add_standard "$port" "$uuid" "$sni" "$sid"
+}
+
+
+view_standard_subscription() {
+    local port="$1" info_file="$HOME/.xray-standard-$1.info"
+    local public sni sid uuid ip url host
+    [ -f "$info_file" ] || { error "端口 $port 缺少客户端公钥信息"; return 1; }
+    [ -f "$xray_config_path" ] || return 1
+    IFS='|' read -r public sni sid < "$info_file"
+    uuid=$(jq -r --argjson port "$port" '.inbounds[] | select(.port == $port) | .settings.clients[0].id' "$xray_config_path")
+    [ -n "$uuid" ] && [ "$uuid" != "null" ] || return 1
+    ip=$(get_public_ip_v4)
+    [ -n "$ip" ] || ip=$(get_public_ip_v6)
+    [ -n "$ip" ] || { error "无法获取公网IP"; return 1; }
+    host="$ip"
+    [[ "$ip" == *:* ]] && host="[$ip]"
+    url="vless://$uuid@$host:$port?encryption=none&security=reality&sni=$sni&sid=$sid&fp=chrome&pbk=$public&flow=xtls-rprx-vision&type=tcp#$(hostname)-standard-$port"
+    printf '\n普通 VLESS (sing-box 兼容) 端口 %s:\n%s\n' "$port" "$url"
+    printf '%s\n' "$url" > "$HOME/xray_standard_$port.txt"
+    chmod 600 "$HOME/xray_standard_$port.txt"
+}
+
+view_all_subscriptions() {
+    local port
+    # Existing encrypted node: retain legacy export behavior.
+    if [ -f "$client_encryption_info_file" ] && [ -f "$client_reality_info_file" ]; then
+        view_subscription_info || true
+    fi
+    shopt -s nullglob
+    for f in "$HOME"/.xray-standard-*.info; do
+        port="\${f##*/}"
+        port="\${port#.xray-standard-}"
+        port="\${port%.info}"
+        if [[ "$port" =~ ^[0-9]+$ ]] && jq -e --argjson port "$port" \
+          'any(.inbounds[]?; .port == $port and .settings.decryption == "none")' "$xray_config_path" >/dev/null 2>&1; then
+            view_standard_subscription "$port" || true
+        fi
+    done
+    shopt -u nullglob
+}
+
 press_any_key_to_continue() {
     echo
     cecho "$C_YELLOW" "按任意键返回主菜单..."
@@ -856,10 +1072,11 @@ main_menu() {
         cecho "$C_PURPLE" "  6. 查看 Xray 日志"
         cecho "$C_PURPLE" "  7. 修改节点配置"
         cecho "$C_PURPLE" "  8. 查看订阅信息"
+        cecho "$C_PURPLE" "  9. 新增普通 VLESS + REALITY + Vision（sing-box兼容）"
         cecho "$C_GREEN"  "────────────────────────────────────────────────────────"
         cecho "$C_RED"    "  0. 退出脚本"
         cecho "$C_GREEN"  "────────────────────────────────────────────────────────"
-        echo -n "  请输入选项 [0-8]: "
+        echo -n "  请输入选项 [0-9]: "
         read -r choice
 
         local needs_pause=true
@@ -871,7 +1088,8 @@ main_menu() {
             5) uninstall_xray ;;
             6) view_xray_log; needs_pause=false ;;
             7) modify_config ;;
-            8) view_subscription_info || true ;;
+            8) view_all_subscriptions || true ;;
+            9) add_standard_interactive ;;
             0) success "感谢使用！"; exit 0 ;;
             *) error "无效选项。" ;;
         esac
@@ -894,6 +1112,7 @@ show_help() {
     echo "  --uuid <UUID>      # 用户UUID (默认: 自动生成)"
     echo "  --sni <域名>       # REALITY SNI (默认: learn.microsoft.com)"
     echo "  --short-id <HEX>  # REALITY Short ID (默认: 20220701)"
+    echo "  --mode <模式>      # encrypted (默认) 或 standard (sing-box)"
     echo "  --quiet, -q        # 静默模式，成功后仅输出订阅链接"
     echo
     echo "示例:"
@@ -909,6 +1128,7 @@ main() {
         local uuid=""
         local sni="learn.microsoft.com"
         local short_id="20220701" # 始终使用默认值
+        local mode="encrypted"
 
         while [ $# -gt 0 ]; do
             case "$1" in
@@ -916,6 +1136,7 @@ main() {
                 --uuid) uuid="${2:?--uuid 缺少值}"; shift 2 ;;
                 --sni) sni="${2:?--sni 缺少值}"; shift 2 ;;
                 --short-id) short_id="${2:?--short-id 缺少值}"; shift 2 ;;
+                --mode) mode="${2:?--mode 缺少值}"; shift 2 ;;
                 --quiet | -q) is_quiet=true; shift ;;
                 *) error "未知参数: $1"; exit 1 ;;
             esac
@@ -933,7 +1154,11 @@ main() {
         info "  UUID: $uuid"
         info "  SNI: $sni"
         info "  Short ID: $short_id"
-        run_install "$port" "$uuid" "$sni" "$short_id"
+        case "$mode" in
+            encrypted) run_install "$port" "$uuid" "$sni" "$short_id" ;;
+            standard) run_add_standard "$port" "$uuid" "$sni" "$short_id" ;;
+            *) error "mode 必须为 encrypted 或 standard"; return 1 ;;
+        esac
     else
         main_menu
     fi

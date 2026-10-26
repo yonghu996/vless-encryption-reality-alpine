@@ -18,6 +18,7 @@ jobs:
           bash tests/test_reality_keys.sh
           bash tests/test_config_temp_suffix.sh
           bash tests/test_log_permissions.sh
+          bash tests/test_standard_vless.sh
       - name: Check tag matches script version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
