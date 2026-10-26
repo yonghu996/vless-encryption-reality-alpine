@@ -1085,7 +1085,7 @@ view_standard_subscription() {
     local port="$1" info_file="$HOME/.xray-standard-$1.info"
     local public sni sid uuid ip url host
     [ -f "$info_file" ] || { error "端口 $port 缺少客户端公钥信息"; return 1; }
-    [ -f "$xray_config_path" ] || return 1
+    [ -f "$standard_xray_config_path" ] || return 1
     IFS='|' read -r public sni sid < "$info_file"
     uuid=$(jq -r --argjson port "$port" '.inbounds[] | select(.port == $port) | .settings.clients[0].id' "$standard_xray_config_path")
     [ -n "$uuid" ] && [ "$uuid" != "null" ] || return 1
