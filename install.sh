@@ -872,133 +872,181 @@ build_standard_inbound() {
 }
 
 ensure_standard_prerequisites() {
-    if [ ! -x "$xray_binary_path" ]; then
-        info "Xray 尚未安装，先安装官方核心..."
-        if ! execute_official_script install; then return 1; fi
-    fi
-    if ! check_xray_version; then
-        error "本机 Xray 不支持 VLESS/REALITY，请先更新核心。"
+    if command -v rc-service >/dev/null 2>&1; then
+        :
+    else
+        error "普通 VLESS 兼容服务目前要求 Alpine/OpenRC。"
         return 1
     fi
+    if [ ! -x "$standard_xray_binary_path" ]; then
+        info "安装独立旧版 Xray 兼容核心（仅供 sing-box 普通 VLESS 节点使用）..."
+        local arch asset tmp
+        case "$(uname -m)" in
+            x86_64|amd64) asset="Xray-linux-64.zip" ;;
+            aarch64|arm64) asset="Xray-linux-arm64-v8a.zip" ;;
+            armv7l|armv7) asset="Xray-linux-arm32-v7a.zip" ;;
+            armv6l) asset="Xray-linux-arm32-v6.zip" ;;
+            *) error "暂不支持兼容核心架构：$(uname -m)"; return 1 ;;
+        esac
+        apk add --no-cache curl unzip >/dev/null || return 1
+        tmp=$(mktemp -d) || return 1
+        if ! curl -fsSL --retry 2 "https://github.com/XTLS/Xray-core/releases/download/v25.9.11/$asset" -o "$tmp/xray.zip" ||
+           ! unzip -t "$tmp/xray.zip" >/dev/null ||
+           ! unzip -p "$tmp/xray.zip" xray > "$tmp/xray"; then
+            rm -rf -- "$tmp"
+            error "下载 Xray v25.9.11 兼容核心失败"
+            return 1
+        fi
+        install -m 755 "$tmp/xray" "$standard_xray_binary_path" || { rm -rf -- "$tmp"; return 1; }
+        install -d -m 755 -o xray -g xray /usr/local/share/xray-standard
+        for data in geoip.dat geosite.dat; do
+            if unzip -p "$tmp/xray.zip" "$data" > "$tmp/$data" 2>/dev/null && [ -s "$tmp/$data" ]; then
+                install -m 644 -o xray -g xray "$tmp/$data" "/usr/local/share/xray-standard/$data" || { rm -rf -- "$tmp"; return 1; }
+            fi
+        done
+        rm -rf -- "$tmp"
+    fi
+    if ! id xray >/dev/null 2>&1; then error "缺少 xray 系统用户"; return 1; fi
+    install -d -m 750 -o root -g xray "$standard_xray_config_dir" || return 1
+    install -d -m 700 -o xray -g xray "$standard_xray_log_dir" || return 1
+    if [ -L "$standard_xray_log_dir" ]; then error "兼容服务日志目录是符号链接，拒绝继续"; return 1; fi
+    if [ ! -e "$standard_xray_log_dir/error.log" ]; then
+        install -m 600 -o xray -g xray /dev/null "$standard_xray_log_dir/error.log" || return 1
+    else
+        chown xray:xray "$standard_xray_log_dir/error.log" && chmod 600 "$standard_xray_log_dir/error.log" || return 1
+    fi
+    cat > "$standard_xray_service_path" <<'EOF'
+#!/sbin/openrc-run
+name="Xray Standard VLESS compatibility service"
+description="Legacy REALITY handshake for sing-box 1.13.x"
+command="/usr/local/bin/xray-standard"
+command_args="run -config /usr/local/etc/xray-standard/config.json"
+command_user="xray:xray"
+command_background="yes"
+pidfile="/run/xray-standard.pid"
+directory="/usr/local/etc/xray-standard"
+export XRAY_LOCATION_ASSET="/usr/local/share/xray-standard"
+depend() {
+    need net
+    want dns
+    after firewall
+}
+start_pre() {
+    [ -s /usr/local/etc/xray-standard/config.json ] || return 1
+    su -s /bin/sh -c 'XRAY_LOCATION_ASSET=/usr/local/share/xray-standard /usr/local/bin/xray-standard run -test -format=json -config /usr/local/etc/xray-standard/config.json' xray
+}
+EOF
+    chmod 755 "$standard_xray_service_path" || return 1
+    rc-update add xray-standard default >/dev/null 2>&1 || true
     prepare_xray_log_permissions
 }
+
 
 # 分别在隔离的临时目录中创建和验证配置；失败回滚已存在的节点。
 run_add_standard() {
     local port="$1" uuid="$2" sni="$3" sid="$4"
-    local config_dir stage_dir candidate inbound_json keys private_key
-    local previous_exists=false
+    local keys private_key public_key inbound_json tmp_config old_inbound old_uuid old_key old_sni old_sid
+    local existing_standard=false
 
     if ! validate_node_inputs "$port" "$uuid" "$sni" "$sid"; then return 1; fi
-    if [ "${#sid}" -gt 8 ]; then
-        error "sing-box 兼容模式 Short ID 最多8位十六进制字符（推荐默认20220701）。"
+    if [ "\${#sid}" -gt 8 ]; then
+        error "sing-box 1.13 Short ID 最多8位十六进制字符"
         return 1
     fi
     if ! ensure_standard_prerequisites; then return 1; fi
 
-    config_dir=$(dirname "$xray_config_path")
-    if ! install -d -m 750 -o root -g xray "$config_dir"; then
-        error "无法准备 Xray 配置目录"
-        return 1
-    fi
+    # Migrate a standard node created by v1.8.0 from the main config without changing its credentials.
     if [ -f "$xray_config_path" ]; then
-        if ! jq -e '.inbounds | type == "array"' "$xray_config_path" >/dev/null 2>&1; then
-            error "现有配置没有 inbounds 数组或 JSON 无效，拒绝覆盖。"
-            return 1
-        fi
-        if jq -e --arg port "$port" \
-            'any(.inbounds[]; (.port | tostring) == $port)' "$xray_config_path" >/dev/null; then
-            error "端口 $port 已被 Xray 节点使用，请换一个端口。"
+        old_inbound=$(jq -c --argjson p "$port" '.inbounds[]? | select(.port == $p and .settings.decryption == "none")' "$xray_config_path" | head -n 1)
+        if [ -n "$old_inbound" ]; then
+            existing_standard=true
+            old_uuid=$(printf '%s' "$old_inbound" | jq -r '.settings.clients[0].id')
+            old_key=$(printf '%s' "$old_inbound" | jq -r '.streamSettings.realitySettings.privateKey')
+            old_sni=$(printf '%s' "$old_inbound" | jq -r '.streamSettings.realitySettings.serverNames[0]')
+            old_sid=$(printf '%s' "$old_inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
+            uuid="$old_uuid"; private_key="$old_key"; sni="$old_sni"; sid="$old_sid"
+            if [ -f "$HOME/.xray-standard-$port.info" ]; then
+                IFS='|' read -r public_key old_sni old_sid < "$HOME/.xray-standard-$port.info"
+            else
+                public_key=""
+            fi
+        elif jq -e --argjson p "$port" 'any(.inbounds[]?; .port == $p)' "$xray_config_path" >/dev/null 2>&1; then
+            error "端口 $port 已被其他主节点占用，请选择新端口。"
             return 1
         fi
     fi
 
-    if ! keys=$(generate_reality_keys); then return 1; fi
-    private_key="${keys%%|*}"
-    if ! inbound_json=$(build_standard_inbound "$port" "$uuid" "$sni" "$sid" "$private_key"); then
-        error "生成普通 VLESS 入站配置失败"
+    if [ "$existing_standard" != true ]; then
+        if ! keys=$(generate_reality_keys "$standard_xray_binary_path"); then return 1; fi
+        private_key="\${keys%%|*}"
+        public_key="\${keys#*|}"
+    fi
+    if [ -z "$public_key" ]; then
+        error "缺少普通节点公钥，无法安全迁移；请确认原节点的 .xray-standard-$port.info 文件是否存在。"
         return 1
     fi
 
-    # 子目录内的 config.json 避免被 Xray 的 -confdir 误加载为第二个活动文件。
-    stage_dir=$(mktemp -d "$config_dir/.xray-stage.XXXXXX") || return 1
-    candidate="$stage_dir/config.json"
-    if ! chown root:xray "$stage_dir" || ! chmod 750 "$stage_dir"; then
-        rm -rf -- "$stage_dir"
-        return 1
-    fi
-    if [ -f "$xray_config_path" ]; then
-        previous_exists=true
-        if ! cp -p "$xray_config_path" "$stage_dir/previous.json" ||
-           ! jq --argjson inbound "$inbound_json" \
-              '.inbounds += [$inbound]' "$xray_config_path" > "$candidate"; then
-            rm -rf -- "$stage_dir"
-            error "追加节点配置失败，原配置未变更"
-            return 1
+    inbound_json=$(jq -n --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg sid "$sid" --arg private_key "$private_key" '{
+        tag: ("vless-standard-" + ($port|tostring)),
+        listen: "::", port: $port, protocol: "vless",
+        settings: {clients: [{id:$uuid, flow:"xtls-rprx-vision"}], decryption:"none"},
+        streamSettings: {network:"tcp", security:"reality", realitySettings:{
+            show:false, dest:($sni+":443"), xver:0, serverNames:[$sni],
+            privateKey:$private_key, shortIds:[$sid]
+        }}
+    }') || return 1
+
+    tmp_config=$(mktemp "$standard_xray_config_dir/config.json.tmp.XXXXXX") || return 1
+    if [ -f "$standard_xray_config_path" ]; then
+        if jq -e --argjson p "$port" 'any(.inbounds[]?; .port == $p)' "$standard_xray_config_path" >/dev/null 2>&1; then
+            error "兼容服务端口 $port 已存在；请先用菜单8确认节点，避免重复添加。"
+            rm -f "$tmp_config"; return 1
+        fi
+        if ! jq --argjson inbound "$inbound_json" '.inbounds += [$inbound]' "$standard_xray_config_path" > "$tmp_config"; then
+            rm -f "$tmp_config"; return 1
         fi
     else
-        if ! jq -n --argjson inbound "$inbound_json" '{
-            log: {loglevel: "warning", error: "/var/log/xray/error.log"},
-            inbounds: [$inbound],
-            outbounds: [{
-                protocol: "freedom", settings: {},
-                streamSettings: {sockopt: {domainStrategy: "UseIPv4v6"}}
-            }]
-        }' > "$candidate"; then
-            rm -rf -- "$stage_dir"
-            error "生成初始 Xray 配置失败"
-            return 1
-        fi
+        jq -n --argjson inbound "$inbound_json" '{
+            log:{loglevel:"warning",error:"/var/log/xray-standard/error.log"},
+            inbounds:[$inbound],
+            outbounds:[{protocol:"freedom",settings:{},streamSettings:{sockopt:{domainStrategy:"UseIPv4v6"}}}]
+        }' > "$tmp_config" || { rm -f "$tmp_config"; return 1; }
     fi
+    chown root:xray "$tmp_config" && chmod 640 "$tmp_config" || { rm -f "$tmp_config"; return 1; }
+    if ! su -s /bin/sh -c "XRAY_LOCATION_ASSET=/usr/local/share/xray-standard $standard_xray_binary_path run -test -format=json -config $tmp_config" xray; then
+        rm -f "$tmp_config"; error "兼容节点配置校验失败，未更改现有配置"; return 1
+    fi
+    if [ -f "$standard_xray_config_path" ]; then cp -p "$standard_xray_config_path" "$standard_xray_config_path.bak" || { rm -f "$tmp_config"; return 1; }; fi
+    mv -f "$tmp_config" "$standard_xray_config_path" || { rm -f "$tmp_config"; return 1; }
 
-    if ! chown root:xray "$candidate" || ! chmod 640 "$candidate"; then
-        rm -rf -- "$stage_dir"
-        error "临时配置权限设置失败"
-        return 1
-    fi
-    if ! su -s /bin/sh -c \
-       "XRAY_LOCATION_ASSET=/usr/local/share/xray $xray_binary_path run -test -format=json -config $candidate" xray; then
-        rm -rf -- "$stage_dir"
-        error "普通 VLESS 配置校验失败，原配置未变更"
-        return 1
-    fi
-
-    if [ "$previous_exists" = true ]; then
-        if ! cp -p "$xray_config_path" "${xray_config_path}.bak"; then
-            rm -rf -- "$stage_dir"
-            error "原配置备份失败，拒绝更新"
-            return 1
-        fi
-    fi
-    if ! mv -f "$candidate" "$xray_config_path"; then
-        rm -rf -- "$stage_dir"
-        error "写入配置失败"
-        return 1
-    fi
-
-    if ! restart_xray; then
-        error "服务启动失败，尝试回滚..."
-        if [ "$previous_exists" = true ]; then
-            cp -p "$stage_dir/previous.json" "$xray_config_path" || true
-            restart_xray || true
+    # If migrating from the main config, remove only this standard inbound and keep all other inbounds untouched.
+    if [ "$existing_standard" = true ]; then
+        local main_tmp
+        main_tmp=$(mktemp "\${xray_config_path}.tmp.XXXXXX") || return 1
+        if jq --argjson p "$port" '.inbounds |= map(select(.port != $p))' "$xray_config_path" > "$main_tmp"; then
+            chown root:xray "$main_tmp" && chmod 640 "$main_tmp" && cp -p "$xray_config_path" "$xray_config_path.bak" && mv -f "$main_tmp" "$xray_config_path"
+            if ! restart_xray; then
+                cp -p "$xray_config_path.bak" "$xray_config_path"
+                rm -f "$main_tmp"
+                error "主服务重启失败；已恢复主配置，兼容节点配置仍保留"
+                return 1
+            fi
         else
-            rm -f "$xray_config_path"
+            rm -f "$main_tmp"; error "迁移后清理主配置失败"; return 1
         fi
-        rm -rf -- "$stage_dir"
-        return 1
     fi
-    rm -rf -- "$stage_dir"
-    # Per-port metadata for the new public key; never overwrite encrypted-node metadata.
-    printf '%s|%s|%s\n' "${keys#*|}" "$sni" "$sid" > "$HOME/.xray-standard-$port.info"
+
+    if rc-service xray-standard status >/dev/null 2>&1; then
+        rc-service xray-standard restart || return 1
+    else
+        rc-service xray-standard start || return 1
+    fi
+    printf '%s|%s|%s\n' "$public_key" "$sni" "$sid" > "$HOME/.xray-standard-$port.info"
     chmod 600 "$HOME/.xray-standard-$port.info"
-    success "普通 VLESS + REALITY + Vision 节点添加成功（端口 $port）"
+    success "sing-box 兼容普通 VLESS 节点已启动（独立旧版 Xray，端口 $port）"
     view_standard_subscription "$port" || true
-    if command -v ss >/dev/null 2>&1; then
-        ss -lnt | grep -E "[:.]$port[[:space:]]" || info "注意：端口 $port 暂未在 ss 中显示监听，请检查 OpenRC 日志。"
-    elif command -v netstat >/dev/null 2>&1; then
-        netstat -lnt | grep -E "[:.]$port[[:space:]]" || info "注意：端口 $port 暂未在 netstat 中显示监听，请检查 OpenRC 日志。"
-    fi
 }
+
 
 add_standard_interactive() {
     local port uuid sni sid
