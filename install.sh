@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # VLESS Encryption + REALITY 一键安装管理脚本
-# 版本: V1.7.4 (Xray 临时 JSON 配置校验修复)
+# 版本: V1.7.5 (Xray 日志权限与 OpenRC 启动修复)
 # 固定配置: VLESS Encryption (native + 0-RTT + ML-KEM-768) + REALITY + xtls-rprx-vision
 
 set -eo pipefail
 umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.7.4"
+SCRIPT_VERSION="1.7.5"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 
@@ -403,6 +403,12 @@ update_xray() {
 
 restart_xray() {
     if [ ! -x "$xray_binary_path" ]; then error "Xray 未安装。"; return 1; fi
+    if [ ! -f "$xray_config_path" ]; then
+        error "找不到节点配置文件，请先选择菜单 1 完成安装。"
+        return 1
+    fi
+    # Repairs root-owned error.log from earlier failed versions, too.
+    if ! prepare_xray_log_permissions; then return 1; fi
     info "正在启动或重启 Xray..."
     if command -v rc-service >/dev/null 2>&1; then
         if ! rc-update add xray default >/dev/null 2>&1; then
@@ -652,14 +658,40 @@ view_subscription_info() {
     fi
 }
 
+prepare_xray_log_permissions() {
+    local log_dir="/var/log/xray" log_file="/var/log/xray/error.log"
+    if ! id xray >/dev/null 2>&1; then
+        error "Xray 专用用户不存在，需先执行安装。"
+        return 1
+    fi
+    # Do not follow arbitrary symlinks while running as root.
+    if [ -L "$log_dir" ] || [ -L "$log_file" ]; then
+        error "日志路径存在符号链接，拒绝自动修改权限：$log_file"
+        return 1
+    fi
+    if ! install -d -m 700 -o xray -g xray "$log_dir"; then
+        error "无法设置 Xray 日志目录权限"
+        return 1
+    fi
+    if [ -e "$log_file" ]; then
+        if [ ! -f "$log_file" ] ||
+           ! chown xray:xray "$log_file" ||
+           ! chmod 600 "$log_file"; then
+            error "无法修复 Xray 现有日志文件权限：$log_file"
+            return 1
+        fi
+    elif ! install -m 600 -o xray -g xray /dev/null "$log_file"; then
+        error "无法为 Xray 用户创建日志文件：$log_file"
+        return 1
+    fi
+}
+
 write_config() {
     local port="$1" uuid="$2" decryption_config="$3" encryption_config="$4"
     local private_key="$5" public_key="$6" sni="$7" short_id="$8"
     local tmp_config
 
-    mkdir -p /var/log/xray
-    chown xray:xray /var/log/xray
-    chmod 700 /var/log/xray
+    if ! prepare_xray_log_permissions; then return 1; fi
     # Xray's external config loader requires the filename to end in .json.
     # -format=json alone does not override its extension check.
     tmp_config=$(mktemp "${xray_config_path}.tmp.XXXXXX") || return 1
@@ -710,8 +742,11 @@ write_config() {
         }],
         "outbounds": [{
             "protocol": "freedom",
-            "settings": {
-                "domainStrategy": "UseIPv4v6"
+            "settings": {},
+            "streamSettings": {
+                "sockopt": {
+                    "domainStrategy": "UseIPv4v6"
+                }
             }
         }]
     }' > "$tmp_config"; then
@@ -720,14 +755,16 @@ write_config() {
         return 1
     fi
 
-    if ! "$xray_binary_path" run -test -format=json -config "$tmp_config"; then
-        rm -f "$tmp_config"
-        error "Xray 配置检查不通过，旧配置未覆盖"
-        return 1
-    fi
+    # Validate as the same restricted user that OpenRC runs under.
+    # A root-run Xray test can create root-owned error.log and break startup.
     if ! chown root:xray "$tmp_config" || ! chmod 640 "$tmp_config"; then
         rm -f "$tmp_config"
         error "设置 Xray 配置权限失败"
+        return 1
+    fi
+    if ! su -s /bin/sh -c         "XRAY_LOCATION_ASSET=/usr/local/share/xray $xray_binary_path run -test -format=json -config $tmp_config" xray; then
+        rm -f "$tmp_config"
+        error "Xray 配置检查不通过，旧配置未覆盖"
         return 1
     fi
     if [ -f "$xray_config_path" ]; then

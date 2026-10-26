@@ -44,6 +44,12 @@ bash /root/xray-menu.sh install --port 12345 --sni www.sega.com
 
 每次版本升级须同步修改 `SCRIPT_VERSION`、新增 `releases/vX.Y.Z.md` 更新说明，并推送同名 `vX.Y.Z` Git 标签。仓库内的 `.github/workflows/release.yml` 将自动执行测试，测试通过后发布 [GitHub Releases](https://github.com/yonghu996/vless-encryption-reality-alpine/releases)。不要仅修改 README 而不发布对应 Release。
 
+## v1.7.5 修复
+
+- 修复 OpenRC 启动时 `/var/log/xray/error.log: permission denied`；使用 Xray 专用用户进行配置检查，并修复旧日志文件属主和权限。
+- 菜单 3 现在先恢复日志权限再启动现有节点，无需重新下载 Xray 或生成新密钥。
+- 迁移已弃用的 `freedom.domainStrategy` 到 `sockopt.domainStrategy`。
+
 ## v1.7.4 修复
 
 - 解决 Xray `unsupported config file extension`：临时配置文件保留 `.json` 后缀。
