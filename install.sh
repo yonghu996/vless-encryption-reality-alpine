@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# VLESS Encryption + REALITY 一键安装管理脚本
-# 版本: V1.7.5 (Xray 日志权限与 OpenRC 启动修复)
-# 固定配置: VLESS Encryption (native + 0-RTT + ML-KEM-768) + REALITY + xtls-rprx-vision
+# VLESS Encryption / Standard VLESS + REALITY + Vision 管理脚本
+# 版本: V1.8.0 (新增 sing-box 兼容普通 VLESS 节点)
+# 可选配置: VLESS Encryption (ML-KEM-768) 或 Standard VLESS + REALITY + Vision
 
 set -eo pipefail
 umask 077
 
 # --- 全局变量 ---
-SCRIPT_VERSION="1.7.5"
+SCRIPT_VERSION="1.8.0"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 
@@ -831,6 +831,176 @@ run_install() {
     if ! view_subscription_info; then
         info "服务已启动，但暂时无法自动获取公网地址，请检查网络后通过菜单8查看订阅。"
     fi
+}
+
+
+# 追加独立普通 VLESS 入站，不触碰已有 Encryption 节点。
+build_standard_inbound() {
+    local port="$1" uuid="$2" sni="$3" sid="$4" private_key="$5"
+    jq -n \
+        --argjson port "$port" --arg uuid "$uuid" \
+        --arg sni "$sni" --arg sid "$sid" --arg private_key "$private_key" \
+    '{
+        tag: ("vless-standard-" + ($port | tostring)),
+        listen: "::", port: $port, protocol: "vless",
+        settings: {
+            clients: [{id: $uuid, flow: "xtls-rprx-vision"}],
+            decryption: "none"
+        },
+        streamSettings: {
+            network: "tcp", security: "reality",
+            realitySettings: {
+                show: false, dest: ($sni + ":443"), xver: 0,
+                serverNames: [$sni], privateKey: $private_key,
+                shortIds: [$sid]
+            }
+        }
+    }'
+}
+
+ensure_standard_prerequisites() {
+    if [ ! -x "$xray_binary_path" ]; then
+        info "Xray 尚未安装，先安装官方核心..."
+        if ! execute_official_script install; then return 1; fi
+    fi
+    if ! check_xray_version; then
+        error "本机 Xray 不支持 VLESS/REALITY，请先更新核心。"
+        return 1
+    fi
+    prepare_xray_log_permissions
+}
+
+# 分别在隔离的临时目录中创建和验证配置；失败回滚已存在的节点。
+run_add_standard() {
+    local port="$1" uuid="$2" sni="$3" sid="$4"
+    local config_dir stage_dir candidate inbound_json keys private_key
+    local previous_exists=false
+
+    if ! validate_node_inputs "$port" "$uuid" "$sni" "$sid"; then return 1; fi
+    if [ "${#sid}" -gt 8 ]; then
+        error "sing-box 兼容模式 Short ID 最多8位十六进制字符（推荐默认20220701）。"
+        return 1
+    fi
+    if ! ensure_standard_prerequisites; then return 1; fi
+
+    config_dir=$(dirname "$xray_config_path")
+    if ! install -d -m 750 -o root -g xray "$config_dir"; then
+        error "无法准备 Xray 配置目录"
+        return 1
+    fi
+    if [ -f "$xray_config_path" ]; then
+        if ! jq -e '.inbounds | type == "array"' "$xray_config_path" >/dev/null 2>&1; then
+            error "现有配置没有 inbounds 数组或 JSON 无效，拒绝覆盖。"
+            return 1
+        fi
+        if jq -e --arg port "$port" \
+            'any(.inbounds[]; (.port | tostring) == $port)' "$xray_config_path" >/dev/null; then
+            error "端口 $port 已被 Xray 节点使用，请换一个端口。"
+            return 1
+        fi
+    fi
+
+    if ! keys=$(generate_reality_keys); then return 1; fi
+    private_key="${keys%%|*}"
+    if ! inbound_json=$(build_standard_inbound "$port" "$uuid" "$sni" "$sid" "$private_key"); then
+        error "生成普通 VLESS 入站配置失败"
+        return 1
+    fi
+
+    # 子目录内的 config.json 避免被 Xray 的 -confdir 误加载为第二个活动文件。
+    stage_dir=$(mktemp -d "$config_dir/.xray-stage.XXXXXX") || return 1
+    candidate="$stage_dir/config.json"
+    if ! chown root:xray "$stage_dir" || ! chmod 750 "$stage_dir"; then
+        rm -rf -- "$stage_dir"
+        return 1
+    fi
+    if [ -f "$xray_config_path" ]; then
+        previous_exists=true
+        if ! cp -p "$xray_config_path" "$stage_dir/previous.json" ||
+           ! jq --argjson inbound "$inbound_json" \
+              '.inbounds += [$inbound]' "$xray_config_path" > "$candidate"; then
+            rm -rf -- "$stage_dir"
+            error "追加节点配置失败，原配置未变更"
+            return 1
+        fi
+    else
+        if ! jq -n --argjson inbound "$inbound_json" '{
+            log: {loglevel: "warning", error: "/var/log/xray/error.log"},
+            inbounds: [$inbound],
+            outbounds: [{
+                protocol: "freedom", settings: {},
+                streamSettings: {sockopt: {domainStrategy: "UseIPv4v6"}}
+            }]
+        }' > "$candidate"; then
+            rm -rf -- "$stage_dir"
+            error "生成初始 Xray 配置失败"
+            return 1
+        fi
+    fi
+
+    if ! chown root:xray "$candidate" || ! chmod 640 "$candidate"; then
+        rm -rf -- "$stage_dir"
+        error "临时配置权限设置失败"
+        return 1
+    fi
+    if ! su -s /bin/sh -c \
+       "XRAY_LOCATION_ASSET=/usr/local/share/xray $xray_binary_path run -test -format=json -config $candidate" xray; then
+        rm -rf -- "$stage_dir"
+        error "普通 VLESS 配置校验失败，原配置未变更"
+        return 1
+    fi
+
+    if [ "$previous_exists" = true ]; then
+        if ! cp -p "$xray_config_path" "${xray_config_path}.bak"; then
+            rm -rf -- "$stage_dir"
+            error "原配置备份失败，拒绝更新"
+            return 1
+        fi
+    fi
+    if ! mv -f "$candidate" "$xray_config_path"; then
+        rm -rf -- "$stage_dir"
+        error "写入配置失败"
+        return 1
+    fi
+
+    if ! restart_xray; then
+        error "服务启动失败，尝试回滚..."
+        if [ "$previous_exists" = true ]; then
+            cp -p "$stage_dir/previous.json" "$xray_config_path" || true
+            restart_xray || true
+        else
+            rm -f "$xray_config_path"
+        fi
+        rm -rf -- "$stage_dir"
+        return 1
+    fi
+    rm -rf -- "$stage_dir"
+    success "普通 VLESS + REALITY + Vision 节点添加成功（端口 $port）"
+    if ! view_subscription_info; then
+        info "节点已添加，但暂时无法获取公网 IP，稍后通过菜单 8 查看链接。"
+    fi
+}
+
+add_standard_interactive() {
+    local port uuid sni sid
+    echo "新增普通 VLESS + REALITY + Vision 节点（兼容 sing-box，不启用 VLESS Encryption）"
+    echo "已有节点会保留，请选择一个未使用的 TCP 端口。"
+    echo -n "监听端口（默认: 443）: "
+    read -r port
+    [ -z "$port" ] && port=443
+    echo -n "UUID（留空自动生成）: "
+    read -r uuid
+    if [ -z "$uuid" ]; then
+        uuid=$(generate_uuid)
+        info "已生成 UUID: $uuid"
+    fi
+    echo -n "REALITY SNI（默认: learn.microsoft.com）: "
+    read -r sni
+    [ -z "$sni" ] && sni="learn.microsoft.com"
+    echo -n "REALITY Short ID（默认: 20220701）: "
+    read -r sid
+    [ -z "$sid" ] && sid="20220701"
+    run_add_standard "$port" "$uuid" "$sni" "$sid"
 }
 
 press_any_key_to_continue() {
