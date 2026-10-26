@@ -40,6 +40,13 @@ bash /root/xray-menu.sh install --port 12345 --sni www.sega.com
 
 在 Alpine 上使用 OpenRC 管理 Xray，自动设置开机启动；卸载会删除 Xray 程序、配置及日志，必须手动输入 `yes` 确认。修改配置会重新生成 VLESS Encryption 及 REALITY 密钥，旧客户端链接将失效。
 
+## v1.7.3 修复
+
+- 兼容 Xray 26.10.21 的 `Password (PublicKey):` REALITY 公钥标签，同时保留对旧标签的支持。
+- 对密钥输出执行格式校验，异常情况明确失败而非写入损坏配置。
+- 临时配置检查显式指定 `-format=json`，避免临时文件无 `.json` 后缀导致检查失败。
+- 增加 `tests/test_reality_keys.sh` 回归测试，用法：`bash tests/test_reality_keys.sh`。
+
 ## v1.7.2 修复
 
 - 将已失效的 `install-geodata` 更改为官方 `update-geodata`。如果扩展 Geo 数据下载失败，保留内置 Geo 数据，不中断节点安装。
